@@ -1,12 +1,11 @@
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from services.engine import Inputs, Abono, motor_completo
 from ui.components import number_money, number_rate_decimal, number_rate_percent, abonos_editor
 
 st.set_page_config(page_title="Motor Financiero Determinístico", layout="wide")
-st.title("Motor Financiero Determinístico (Excel EXACTO)")
-st.caption("Implementación basada en las fórmulas reales que compartiste (VF, días, acumulados, recálculo por abono a capital).")
+st.title("Simulador cargos SAF")
 
 st.subheader("Configuración de la Obligación")
 c1, c2, c3 = st.columns(3)
@@ -26,25 +25,67 @@ ab_rows = abonos_editor()
 
 def parse_abonos(rows):
     out = []
-    for r in rows:
-        f = str(r.get("Fecha","")).strip()
-        if not f:
-            continue
+    
+    # If the rows come from data_editor as DataFrame, we might need to iterate differently
+    # But usually Streamlit data_editor returns a DF if input was DF.
+    import pandas as pd
+    
+    iterator = []
+    if isinstance(rows, pd.DataFrame):
+        # Convert to list of dicts to reuse logic, or iterate directly
+        iterator = rows.to_dict(orient="records")
+    elif isinstance(rows, list):
+        iterator = rows
+    else:
+        return []
+
+    def to_decimal(val):
+        if val is None:
+            return Decimal("0")
+        s = str(val).strip()
+        if not s or s.lower() in ["nan", "nat", "none", "null"]:
+            return Decimal("0")
         try:
-            d = datetime.strptime(f, "%Y-%m-%d").date()
-        except Exception:
-            # intenta dd/mm/yyyy
-            try:
-                d = datetime.strptime(f, "%d/%m/%Y").date()
-            except Exception:
+            return Decimal(s)
+        except:
+            return Decimal("0")
+
+    for r in iterator:
+        f = r.get("Fecha")
+        if f is None or str(f).strip() == "" or str(f).strip().lower() == "nat":
+            continue
+        
+        d = None
+        if isinstance(f, (date, datetime)):
+            d = f if isinstance(f, date) else f.date()
+        else:
+            # Fallback for string input just in case
+            f_str = str(f).strip()
+            # pandas sometimes gives NaT or nan
+            if f_str.lower() in ["nat", "nan", "none"]:
                 continue
+                
+            try:
+                d = datetime.strptime(f_str, "%Y-%m-%d").date()
+            except Exception:
+                try:
+                    d = datetime.strptime(f_str, "%d/%m/%Y").date()
+                except Exception:
+                    continue
+        
+        if not d:
+            continue
+            
         out.append(Abono(
             fecha=d,
-            abono_capital=Decimal(str(r.get("Abono Capital",0) or 0)),
-            abono_int_rem=Decimal(str(r.get("Abono Int Rem",0) or 0)),
-            abono_int_mor=Decimal(str(r.get("Abono Int Mor",0) or 0)),
+            abono_capital=to_decimal(r.get("Abono Capital")),
+            abono_int_rem=to_decimal(r.get("Abono Int Rem")),
+            abono_int_mor=to_decimal(r.get("Abono Int Mor")),
         ))
     return out
+
+if "calculation_result" not in st.session_state:
+    st.session_state["calculation_result"] = None
 
 btn = st.button("Recalcular Tabla", type="primary", use_container_width=True)
 
@@ -60,12 +101,23 @@ if btn:
     abonos = parse_abonos(ab_rows)
 
     rem, mora, state = motor_completo(inp, abonos)
+    st.session_state["calculation_result"] = {
+        "rem": rem,
+        "mora": mora,
+        "state": state
+    }
 
-    st.success(f"Capital base mora (Saldo capital final + Int Rem final): {state['capital_base_mora']} | Tasa diaria mora: {state['tasa_diaria_mora']}")
+if st.session_state["calculation_result"]:
+    res = st.session_state["calculation_result"]
+    rem = res["rem"]
+    mora = res["mora"]
+    state = res["state"]
+
+
 
     colA, colB = st.columns(2)
     with colA:
-        st.subheader("Periodo de Causación — Intereses Remuneratorios")
+        st.subheader("Periodo de Causación de Intereses Remuneratorio")
         st.dataframe(rem, use_container_width=True, height=520)
         import csv, io
         buf = io.StringIO()
@@ -76,7 +128,7 @@ if btn:
         st.download_button("Descargar Remuneratorio (CSV)", data=buf.getvalue().encode("utf-8"), file_name="remuneratorio.csv", mime="text/csv", use_container_width=True)
 
     with colB:
-        st.subheader("Periodo de Causación — Intereses Moratorios")
+        st.subheader("Periodo de Causación de Intereses Moratorios")
         st.dataframe(mora, use_container_width=True, height=520)
         import csv, io
         buf2 = io.StringIO()
