@@ -12,3 +12,11 @@ def dias_360_excel(current_date, prev_date) -> int:
         return 2
 
     return 1
+
+from datetime import date, timedelta
+import calendar
+
+def get_end_of_month(d: date) -> date:
+    """Returns the last day of the month for the given date."""
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    return date(d.year, d.month, last_day)
