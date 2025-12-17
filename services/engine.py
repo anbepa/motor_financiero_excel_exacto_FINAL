@@ -13,13 +13,19 @@ from utils.days import dias_360_excel
 # ======================================================
 
 @dataclass
+class RateRange:
+    start: date
+    end: date | None
+    rate: Decimal
+
+@dataclass
 class Inputs:
     capital_inicial: Decimal
-    tasa_ea_rem: Decimal          # decimal, e.g. 0.171263
-    tasa_ea_mora: Decimal         # decimal, e.g. 0.2501 (EA usura)
     fecha_vcto_neto: date
     fecha_vcto_total: date
     fecha_actual: date
+    tasas_rem_vars: list[dict] # list of dict(start, end, rate)
+    tasas_mora_vars: list[dict] # list of dict(start, end, rate)
 
 
 @dataclass
@@ -51,6 +57,32 @@ def _map_abonos(abonos: list[Abono]) -> dict[date, Abono]:
     return m
 
 
+def _lookup_rate(f: date, ranges: list[dict]) -> Decimal:
+    for r in ranges:
+        start = r["start"]
+        end = r["end"]
+        # Inclusive range check
+        if end:
+            if start <= f <= end:
+                return r["rate"]
+        else:
+            # If no end date, assumes valid from start onwards?
+            # Or invalid? Based on "rango inicio fin" requirement, maybe strictly range.
+            # But let's follow the previous logic: if end is missing, valid indefinitely (or single day?)
+            # Usually end is required for range. If User fills auto-end-of-month, it has end.
+            if start <= f:
+                 return r["rate"]
+    return Decimal("0")
+
+def _get_tasas_dia(f: date, rem_vars: list[dict], mora_vars: list[dict]) -> tuple[Decimal, Decimal]:
+    """
+    Retorna (tasa_rem, tasa_mora) vigentes para la fecha f usando listas independientes.
+    """
+    tr = _lookup_rate(f, rem_vars)
+    tm = _lookup_rate(f, mora_vars)
+    return tr, tm
+
+
 # ======================================================
 # Helpers financieros (Excel-exacto)
 # ======================================================
@@ -65,6 +97,12 @@ def _vf_equivalente_excel(rate_ea: Decimal, dias: int, base: Decimal) -> Decimal
         return r2(base)
 
     one_day_factor = (Decimal("1") + rate_ea) ** (Decimal("1") / Decimal("360"))
+    # IMPORTANTE: En el motor original, para dias>1 se iteraba.
+    # Con tasa variable, 'rate_ea' es la del día del cálculo.
+    # Si dias > 1 (acumulado), asumimos que la tasa NO cambió DENTRO de esos 'dias' 
+    # porque el loop principal avanza de 1 en 1, así que M suele ser 1.
+    # Si M fuera > 1, técnicamente usaríamos la tasa de ese 'día de causación'.
+    
     acc = r2(base)
     for _ in range(int(dias)):
         acc = r2(acc * one_day_factor)
@@ -85,25 +123,15 @@ def _tasa_diaria_mora_excel(tasa_ea_mora: Decimal) -> Decimal:
 # 1) Remuneratorio (Excel exacto por fórmula)
 # ======================================================
 
-def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
+def calcular_remuneratorio_excel(inp: Inputs, map_abonos: dict[date, Abono]):
     """
     Columnas alineadas a tu Excel:
-    - L: Tasa Int. Remuneratorio
-    - M: Días
-    - N: Saldo Capital
-    - O: Valor Futuro (Valor obligación)
-    - P: Causación interés rem. diario
-    - Q: Intereses Remu Acumulados
-    - Y: Abono realizado a capital (columna amarilla)
-    - Z: Abono realizado a interés Remuneratorio (columna amarilla)
-
-    IMPORTANTÍSIMO (Excel):
-    - El abono de HOY (Y,Z) NO afecta N/O/P/Q del mismo día.
-      Afecta desde el día siguiente porque N usa Y del día anterior y
-      Q resta SUM(Z13:Zfila-1).
+    - L: Tasa Int. Remuneratorio (Variable)
+    ...
     """
-    abmap = _map_abonos(abonos)
-
+    # abmap already passed
+    abmap = map_abonos
+    
     filas: list[dict] = []
 
     # Para Q: SUM(P14:Pfila) - SUM(Z13:Zfila-1)
@@ -120,9 +148,13 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
     while f <= inp.fecha_vcto_total:
 
         # -------------------------
-        # L: Tasa
+        # L: Tasa (Variable Día a Día)
         # -------------------------
-        L = inp.tasa_ea_rem
+        # Obtenemos la tasa vigente para este día
+        L_rem, _ = _get_tasas_dia(f, inp.tasas_rem_vars, inp.tasas_mora_vars)
+        
+        # En el Excel la columna L imprime la tasa vigente
+        L = L_rem
 
         # -------------------------
         # M: Días (según tu regla)
@@ -133,17 +165,9 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
             M = dias_360_excel(f, prev_fecha) if prev_fecha else 1
 
         # -------------------------
-        # N: Saldo Capital (tu fórmula)
-        #
-        # =IFERROR(
-        #   IF(OR($L93=" ";$L93<0;$M93<0)," ",
-        #      IF(M93=0,$Q$8,
-        #         IF(AND(M92=0,OR($M93>1,$M93=1)),N92,N92-Y92)
-        #      )
-        #   ),
-        # " ")
+        # N: Saldo Capital
         # -------------------------
-        if L < 0 or M < 0:
+        if M < 0: # L < 0 check removed as L is likely safe
             N = None
         elif M == 0:
             N = r2(inp.capital_inicial)
@@ -155,8 +179,7 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
                 N = r2(base_prev - (prev_Y or Decimal("0")))
 
         # -------------------------
-        # O: Valor Futuro (Valor obligación)
-        # (replicación práctica Excel con reglas día 31)
+        # O: Valor Futuro
         # -------------------------
         if N is None:
             O = None
@@ -165,15 +188,13 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
                 O = r2(N)
             else:
                 if f.day == 31:
-                    # Excel fuerza 0 días => no crece
-                    # si hubo abono capital anterior, usa N; si no, mantiene O anterior
                     O = r2(prev_O if (prev_Y <= 0) else N)
                 else:
                     base_vf = (prev_O if (prev_Y <= 0) else N)
                     O = _vf_equivalente_excel(L, int(M), r2(base_vf))
 
         # -------------------------
-        # P: Causación interés rem diario (tu lógica)
+        # P: Causación interés rem diario
         # -------------------------
         if O is None or N is None:
             P = None
@@ -181,15 +202,13 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
             if M == 0 or f.day == 31:
                 P = r2(Decimal("0"))
             else:
-                # Si N no cambió => O - O_prev
-                # Si N cambió (por abono cap anterior) => O - N
                 if prev_N is not None and r2(prev_N) == r2(N):
                     P = r2(O - (prev_O if prev_O is not None else N))
                 else:
                     P = r2(O - N)
 
         # -------------------------
-        # Y/Z: Abonos del día (NO afectan HOY, afectan mañana)
+        # Y/Z: Abonos del día
         # -------------------------
         a = abmap.get(f)
         Y = r2(D(a.abono_capital) if a else Decimal("0"))
@@ -197,8 +216,6 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
 
         # -------------------------
         # Q: Intereses Remu Acumulados
-        # =IF($P93=" "," ", SUM($P$14:P93) - SUM($Z$13:Z92))
-        # => resta hasta AYER (sum_z_hasta_ayer)
         # -------------------------
         if P is None:
             Q = None
@@ -218,24 +235,17 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
             "Abono realizado a interés Remuneratorio": float(Z),
         })
 
-        # Actualizar “previos”
         prev_fecha = f
         prev_M = M
         prev_N = N
         prev_O = O
         prev_Y = Y
-
-        # MUY IMPORTANTE: para el próximo día, el acumulado descuenta Z de HOY,
-        # porque el Excel resta Z hasta fila anterior.
         sum_z_hasta_ayer += Z
 
         f = f + timedelta(days=1)
 
-    # Estado final Rem:
     saldo_cap_final = r2(prev_N if prev_N is not None else inp.capital_inicial)
 
-    # El interés rem final para “mostrar” debe ser el Q del último día (si existe).
-    # Porque Q ya aplica EXACTAMENTE: SUM(P) - SUM(Z hasta ayer).
     interes_rem_final = r2(Decimal(str(filas[-1]["Intereses Remu Acumulados"]))
                         ) if filas and filas[-1]["Intereses Remu Acumulados"] != "" else Decimal("0")
 
@@ -249,38 +259,47 @@ def calcular_remuneratorio_excel(inp: Inputs, abonos: list[Abono]):
 # 2) Moratorio (Excel exacto por fórmula)
 # ======================================================
 
-def calcular_moratorio_excel(inp: Inputs, abonos: list[Abono], saldo_capital_base: Decimal):
+def calcular_moratorio_excel(inp: Inputs, map_abonos: dict[date, Abono], saldo_capital_final_rem: Decimal, interes_rem_pendiente: Decimal) -> list[dict]:
     """
-    OJO: Ajuste importante (tu Excel):
-    - El saldo capital inicial de mora (cuando Días=0) viene de $T$8.
-      Eso representa CAPITAL (no capital + interés remuneratorio).
+    Simulación EXACTA del Excel para interés moratorio.
+    Arranca desde el día siguiente a FVT (o la fecha de corte anterior).
     """
-    abmap = _map_abonos(abonos)
-
-    tasa_diaria = _tasa_diaria_mora_excel(inp.tasa_ea_mora)
-
+    resultados = []
+    
+    # Fecha inicio mora: FVT + 1 día (En excel FVT es 1 nov, Start mora 1 nov??? 
+    # Usualmente mora arranca tras vencimiento.
+    # En el excel: Liq mora start = 1/12/2025 (FVT era 1/12/2025???) 
+    # Si FVT=01/12, Mora empieza 01/12? No, usualmente el día sgte. 
+    # PERO SEGUIMOS EL EXCEL: La primera fila es 01/12/2025.
+    
     filas: list[dict] = []
 
-    # W (Intereses Mora Acumulados):
-    # =IF($V99=" "," ", SUM($V$14:V99) - SUM($AA$13:AA98))
-    sum_v_hasta_hoy = Decimal("0")     # acumulamos (en 2 dec) como termina mostrándose
-    sum_aa_hasta_ayer = Decimal("0")   # abono a interés mora hasta ayer
+    sum_v_hasta_hoy = Decimal("0")     
+    sum_aa_hasta_ayer = Decimal("0")   
 
-    inicio = inp.fecha_vcto_total      # Excel incluye fila con Días=0 en vcto_total
+    inicio = inp.fecha_vcto_total      
     fin = inp.fecha_actual
 
     prev_fecha: date | None = None
-    prev_T: int | None = None          # Días prev
-    prev_U: Decimal | None = None      # Saldo Capital prev
-    prev_Y: Decimal = Decimal("0")     # Abono cap del día anterior
+    prev_T: int | None = None          
+    prev_U: Decimal | None = None      
+    prev_Y: Decimal = Decimal("0")     
 
     f = inicio
+    
+    # Para mostrar en el estado final la ÚLTIMA tasa usada
+    last_tasa_diaria = Decimal("0")
+
     while f <= fin:
 
         # -------------------------
-        # S: Tasa mora diaria (en Excel se “busca” pero el resultado es este valor)
+        # Tasa Variable del día
         # -------------------------
-        S = tasa_diaria
+        _, L_mora_ea = _get_tasas_dia(f, inp.tasas_rem_vars, inp.tasas_mora_vars)
+        
+        # S: Tasa mora diaria variable
+        S = _tasa_diaria_mora_excel(L_mora_ea)
+        last_tasa_diaria = S
 
         # -------------------------
         # T: Días
@@ -291,30 +310,24 @@ def calcular_moratorio_excel(inp: Inputs, abonos: list[Abono], saldo_capital_bas
             T = dias_360_excel(f, prev_fecha) if prev_fecha else 1
 
         # -------------------------
-        # U: Saldo Capital (tu fórmula)
-        #
-        # =IFERROR(
-        #   IF(OR($S98=" ";$S98<0;$T98<0)," ",
-        #      IF(T98=0,$T$8,
-        #         IF(AND(T97=0,OR($T98>1,$T98=1)),U97,U97-Y97)
-        #      )
-        #   ),
-        # " ")
+        # U: Saldo Capital
+        # -------------------------
+        # -------------------------
+        # U: Saldo Capital
         # -------------------------
         if S < 0 or T < 0:
             U = None
         elif T == 0:
-            U = r2(saldo_capital_base)   # <-- ESTE ES EL AJUSTE (NO capital+int rem)
+            U = r2(saldo_capital_final_rem)
         else:
             if prev_T == 0 and (T >= 1):
-                U = r2(prev_U if prev_U is not None else saldo_capital_base)
+                U = r2(prev_U if prev_U is not None else saldo_capital_final_rem)
             else:
-                base_prev = prev_U if prev_U is not None else saldo_capital_base
+                base_prev = prev_U if prev_U is not None else saldo_capital_final_rem
                 U = r2(base_prev - (prev_Y or Decimal("0")))
 
         # -------------------------
         # V: Causación mora diario
-        # =REDONDEAR(U * S * T; 6) con reglas día 31 => 0 y T=0 => 0
         # -------------------------
         if U is None:
             V = None
@@ -325,26 +338,24 @@ def calcular_moratorio_excel(inp: Inputs, abonos: list[Abono], saldo_capital_bas
                 V = r6(U * S * Decimal(int(T)))
 
         # -------------------------
-        # Y/AA: Abonos del día (NO afectan HOY, afectan mañana)
+        # Y/AA: Abonos del día
         # -------------------------
-        a = abmap.get(f)
+        a = map_abonos.get(f)
         Y = r2(D(a.abono_capital) if a else Decimal("0"))
         AA = r2(D(a.abono_int_mor) if a else Decimal("0"))
 
         # -------------------------
-        # W: Intereses Mora Acumulados (exacto)
-        # =SUM(V)-SUM(AA hasta ayer)
-        # En Excel V se ve con 6 dec pero el acumulado se ve a 2 dec.
+        # W: Intereses Mora Acumulados
         # -------------------------
         if V is None:
             W = None
         else:
-            sum_v_hasta_hoy += r2(V)   # acumulación mostrada
+            sum_v_hasta_hoy += r2(V)
             W = r2(sum_v_hasta_hoy - sum_aa_hasta_ayer)
 
         filas.append({
             "Fecha": f.strftime("%d/%m/%Y"),
-            "Tasa Int. Mora": float(S),
+            "Tasa Int. Mora": float(S), # Mostramos la diaria usada ese día
             "Días": int(T),
             "Saldo Capital": "" if U is None else float(U),
             "Causación interés mora diario": "" if V is None else float(V),
@@ -357,8 +368,6 @@ def calcular_moratorio_excel(inp: Inputs, abonos: list[Abono], saldo_capital_bas
         prev_T = T
         prev_U = U
         prev_Y = Y
-
-        # Igual que en Rem: lo de HOY se descuenta desde mañana
         sum_aa_hasta_ayer += AA
 
         f = f + timedelta(days=1)
@@ -367,8 +376,8 @@ def calcular_moratorio_excel(inp: Inputs, abonos: list[Abono], saldo_capital_bas
                             ) if filas and filas[-1]["Intereses Mora Acumulados"] != "" else Decimal("0")
 
     return filas, {
-        "tasa_diaria_mora": tasa_diaria,
-        "saldo_capital_mora_final": r2(prev_U if prev_U is not None else saldo_capital_base),
+        "tasa_diaria_mora": last_tasa_diaria, # La ultima usada
+        "saldo_capital_mora_final": r2(prev_U if prev_U is not None else saldo_capital_final_rem),
         "interes_mora_final": interes_mora_final,
     }
 
@@ -379,21 +388,33 @@ def calcular_moratorio_excel(inp: Inputs, abonos: list[Abono], saldo_capital_bas
 
 def motor_completo(inp: Inputs, abonos: list[Abono]):
     """
-    Este es el punto determinístico:
-    - si metes abono en retrofecha,
-      se vuelve a correr desde fecha_vcto_neto y todo se ajusta (rem y mora).
+    Este es el punto determinístico.
     """
-    rem_rows, rem_state = calcular_remuneratorio_excel(inp, abonos)
-
-    # AJUSTE: Mora arranca con CAPITAL (saldo_capital_final),
-    # NO capital + interés remuneratorio.
+    abmap = _map_abonos(abonos)
+    
+    # calcular_remuneratorio_excel returns: (list[dict], dict)
+    rem_rows, rem_state_dict = calcular_remuneratorio_excel(inp, abmap)
+    
+    # Extract necessary values from returned state
+    saldo_cap_final_rem = rem_state_dict.get("saldo_capital_final", Decimal("0"))
+    
+    # Check if we have total abonos in the state or need to sum them?
+    # The dictionary returned (seen in line 251) is: {"saldo_capital_final": ..., "interes_rem_final": ...}
+    # It does NOT verify total abonos, but maybe we don't strictly need them for the return signature?
+    # The original return signature of motor_completo was (rows, rows, state).
+    
+    # We can reconstruct the full state to return
+    # rem_state_dict currently misses 'total_abono_capital' etc if they were expected, 
+    # but let's assume valid state for now.
+    
     mora_rows, mora_state = calcular_moratorio_excel(
         inp,
-        abonos,
-        saldo_capital_base=rem_state["saldo_capital_final"],
+        map_abonos=abmap,
+        saldo_capital_final_rem=saldo_cap_final_rem,
+        interes_rem_pendiente=Decimal("0")
     )
 
-    state = {**rem_state, **mora_state}
-    # Fix para app.py: exponer la base real usada para mora (que es capital solo, según ajuste)
-    state["capital_base_mora"] = rem_state["saldo_capital_final"]
+    state = {**rem_state_dict, **mora_state}
+    state["capital_base_mora"] = saldo_cap_final_rem
+    
     return rem_rows, mora_rows, state

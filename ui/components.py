@@ -104,3 +104,87 @@ def abonos_editor():
     )
     
     return edited
+
+
+    return edited
+
+
+    return edited
+
+
+def tasas_editor():
+    """
+    Componente para editar las tasas separadas en dos tablas.
+    """
+    import pandas as pd
+    from datetime import date, datetime
+    import calendar
+
+    # --- Helpers ---
+    def get_end_of_month(d: date) -> date:
+        if not d: return None
+        try:
+            last_day = calendar.monthrange(d.year, d.month)[1]
+            return date(d.year, d.month, last_day)
+        except:
+            return None
+
+    # --- Remuneratorio ---
+    st.markdown("#### Histórico Tasas Remuneratorias")
+    
+    defaults_rem = {"Fecha Inicio": None, "Fecha Fin": None, "Tasa Rem EA (%)": 0.0}
+    if "tasas_rem_vars" not in st.session_state:
+        st.session_state["tasas_rem_vars"] = pd.DataFrame([defaults_rem])
+
+    # data_editor uses the state directly
+    edited_rem = st.data_editor(
+        st.session_state["tasas_rem_vars"],
+        column_config={
+            "Fecha Inicio": st.column_config.DateColumn("Fecha Inicio", format="DD/MM/YYYY"),
+            "Fecha Fin": st.column_config.DateColumn("Fecha Fin", format="DD/MM/YYYY"),
+            "Tasa Rem EA (%)": st.column_config.NumberColumn("Tasa Rem EA (%)", format="%.4f", min_value=0.0)
+        },
+        num_rows="dynamic",
+        use_container_width=True,
+        key="tasas_rem_editor_widget"
+    )
+    
+    if edited_rem is not None and not edited_rem.equals(st.session_state["tasas_rem_vars"]):
+        # Clean data before saving
+        for col in ["Fecha Inicio", "Fecha Fin"]:
+            if col in edited_rem.columns:
+                 edited_rem[col] = pd.to_datetime(edited_rem[col], errors='coerce').dt.date
+        
+        st.session_state["tasas_rem_vars"] = edited_rem
+        # st.rerun() REMOVED to avoid double-reload feeling
+
+
+    # --- Moratorio ---
+    st.markdown("#### Histórico Tasas Usura/Mora")
+
+    defaults_mora = {"Fecha Inicio": None, "Fecha Fin": None, "Tasa Mora EA (%)": 0.0}
+    if "tasas_mora_vars" not in st.session_state:
+        st.session_state["tasas_mora_vars"] = pd.DataFrame([defaults_mora])
+
+    edited_mora = st.data_editor(
+        st.session_state["tasas_mora_vars"],
+        column_config={
+            "Fecha Inicio": st.column_config.DateColumn("Fecha Inicio", format="DD/MM/YYYY"),
+            "Fecha Fin": st.column_config.DateColumn("Fecha Fin", format="DD/MM/YYYY"),
+            "Tasa Mora EA (%)": st.column_config.NumberColumn("Tasa Mora EA (%)", format="%.4f", min_value=0.0)
+        },
+        num_rows="dynamic",
+        use_container_width=True,
+        key="tasas_mora_editor_widget"
+    )
+
+    if edited_mora is not None and not edited_mora.equals(st.session_state["tasas_mora_vars"]):
+        # Clean data before saving
+        for col in ["Fecha Inicio", "Fecha Fin"]:
+            if col in edited_mora.columns:
+                 edited_mora[col] = pd.to_datetime(edited_mora[col], errors='coerce').dt.date
+        
+        st.session_state["tasas_mora_vars"] = edited_mora
+        # st.rerun() REMOVED
+
+    return None
