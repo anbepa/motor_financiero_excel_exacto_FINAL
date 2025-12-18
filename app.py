@@ -1,3 +1,4 @@
+import copy
 import streamlit as st
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
@@ -294,8 +295,87 @@ def parse_abonos(rows):
         ))
     return out
 
+def _abonos_signature(abonos: list[Abono]) -> tuple:
+    """
+    Firma inmutable que representa el estado actual de los abonos.
+    """
+    items = []
+    for a in sorted(abonos, key=lambda x: x.fecha):
+        items.append((
+            a.fecha.isoformat(),
+            str(Decimal(a.abono_capital)),
+            str(Decimal(a.abono_int_rem)),
+            str(Decimal(a.abono_int_mor)),
+        ))
+    return tuple(items)
+
+def _abonos_as_dicts(abonos: list[Abono]) -> list[dict]:
+    return [
+        {
+            "fecha": a.fecha,
+            "abono_capital": Decimal(a.abono_capital),
+            "abono_int_rem": Decimal(a.abono_int_rem),
+            "abono_int_mor": Decimal(a.abono_int_mor),
+        }
+        for a in sorted(abonos, key=lambda x: x.fecha)
+    ]
+
+def _annotate_recalculations(rows: list[dict], abonos: list[Abono]) -> list[dict]:
+    """
+    Marca visualmente las filas que fueron recalculadas por un abono,
+    añadiendo columnas de trazabilidad sin alterar la lógica financiera.
+    """
+    if not rows:
+        return rows
+
+    abono_fechas = sorted({a.fecha for a in abonos})
+    annotated: list[dict] = []
+
+    for r in rows:
+        fecha_str = r.get("Fecha")
+        flag = False
+        detonante = ""
+        try:
+            fecha_row = datetime.strptime(str(fecha_str), "%d/%m/%Y").date()
+            fecha_trigger = max([f for f in abono_fechas if f <= fecha_row], default=None)
+            if fecha_trigger:
+                flag = True
+                detonante = fecha_trigger.strftime("%d/%m/%Y")
+        except Exception:
+            fecha_row = None
+
+        annotated_row = {**r}
+        annotated_row["Recalculado"] = "Sí" if flag else "No"
+        annotated_row["Recalculado desde abono"] = detonante
+        annotated.append(annotated_row)
+
+    return annotated
+
+def _push_history_entry(label: str, abonos: list[Abono], abono_signature: tuple, rem: list[dict], mora: list[dict], stage: str):
+    """
+    Conserva un snapshot completo de ambas tablas para trazabilidad cronológica.
+    """
+    if "history_versions" not in st.session_state:
+        st.session_state["history_versions"] = []
+
+    st.session_state["history_versions"].append({
+        "label": label,
+        "stage": stage,
+        "signature": abono_signature,
+        "abonos": _abonos_as_dicts(abonos),
+        "timestamp": datetime.now(),
+        "rem": copy.deepcopy(rem),
+        "mora": copy.deepcopy(mora),
+    })
+
 if "calculation_result" not in st.session_state:
     st.session_state["calculation_result"] = None
+if "history_versions" not in st.session_state:
+    st.session_state["history_versions"] = []
+if "last_abonos_signature" not in st.session_state:
+    st.session_state["last_abonos_signature"] = None
+if "last_abonos_objects" not in st.session_state:
+    st.session_state["last_abonos_objects"] = []
 
 btn = st.button("Recalcular Tabla", type="primary", use_container_width=True)
 
@@ -312,12 +392,57 @@ if btn:
     )
     abonos = parse_abonos(ab_rows)
 
+    current_signature = _abonos_signature(abonos)
+    previous_signature = st.session_state.get("last_abonos_signature")
+    previous_calc = st.session_state.get("calculation_result")
+    previous_abonos = st.session_state.get("last_abonos_objects", [])
+
+    # Guarda el estado previo antes de recalcular si los abonos cambiaron
+    if previous_calc and current_signature != previous_signature:
+        last_entry = st.session_state["history_versions"][-1] if st.session_state["history_versions"] else None
+        last_signature = last_entry["signature"] if last_entry else None
+        if previous_signature != last_signature:
+            nuevas_fechas = sorted({a.fecha for a in abonos} - {a.fecha for a in previous_abonos})
+            if nuevas_fechas:
+                fecha_ref = nuevas_fechas[0].strftime("%d/%m/%Y")
+                label_prev = f"Estado previo antes del abono del {fecha_ref}"
+            else:
+                label_prev = "Estado previo antes del nuevo recálculo"
+
+            _push_history_entry(
+                label_prev,
+                previous_abonos,
+                previous_signature,
+                previous_calc["rem"],
+                previous_calc["mora"],
+                stage="antes de abono"
+            )
+
     rem, mora, state = motor_completo(inp, abonos)
+
+    rem = _annotate_recalculations(rem, abonos)
+    mora = _annotate_recalculations(mora, abonos)
+
     st.session_state["calculation_result"] = {
         "rem": rem,
         "mora": mora,
         "state": state
     }
+    st.session_state["last_abonos_signature"] = current_signature
+    st.session_state["last_abonos_objects"] = abonos
+
+    last_history_signature = st.session_state["history_versions"][-1]["signature"] if st.session_state["history_versions"] else None
+    if abonos and (current_signature != previous_signature or current_signature != last_history_signature):
+        fechas_resumen = ", ".join(sorted({a.fecha.strftime("%d/%m/%Y") for a in abonos}))
+        label_post = f"Post-abono ({fechas_resumen})"
+        _push_history_entry(
+            label_post,
+            abonos,
+            current_signature,
+            rem,
+            mora,
+            stage="post abono"
+        )
 
 if st.session_state["calculation_result"]:
     res = st.session_state["calculation_result"]
@@ -348,6 +473,32 @@ if st.session_state["calculation_result"]:
         for row in mora:
             w2.writerow(row)
         st.download_button("Descargar Moratorio (CSV)", data=buf2.getvalue().encode("utf-8"), file_name="moratorio.csv", mime="text/csv", use_container_width=True)
+
+    history = st.session_state.get("history_versions", [])
+    if history:
+        with st.expander("Histórico de recálculos", expanded=False):
+            options = [
+                f"{idx+1}. {h['label']} ({h['stage']}) - {h['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"
+                for idx, h in enumerate(history)
+            ]
+            selection = st.selectbox("Selecciona una versión histórica", options=options, index=len(options)-1)
+            idx = options.index(selection)
+            selected = history[idx]
+
+            resumen_abonos = ", ".join([
+                f"{a['fecha'].strftime('%d/%m/%Y')}: Cap {a['abono_capital']}, Rem {a['abono_int_rem']}, Mor {a['abono_int_mor']}"
+                for a in selected.get("abonos", [])
+            ]) or "Sin abonos registrados"
+
+            st.markdown(f"**Detalle versión:** {selected['label']}")
+            st.markdown(f"- Etapa: {selected['stage']}")
+            st.markdown(f"- Abonos: {resumen_abonos}")
+
+            hist_colA, hist_colB = st.columns(2)
+            with hist_colA:
+                st.dataframe(selected["rem"], use_container_width=True, height=350)
+            with hist_colB:
+                st.dataframe(selected["mora"], use_container_width=True, height=350)
 
 else:
     st.info("Configura parámetros y presiona **Recalcular Tabla**.")
